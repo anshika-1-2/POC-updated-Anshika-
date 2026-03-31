@@ -6,6 +6,7 @@ Run:  streamlit run app.py
 """
 
 import json
+import re
 import tempfile
 from pathlib import Path
 
@@ -131,16 +132,17 @@ st.markdown("""
 
 # ── Session-state initialisation ─────────────────────────────────────────────
 DEFAULTS = dict(
-    result       = None,
-    dri          = None,
-    sb_name      = "",
-    sb_allergen  = "",
-    sb_sex       = "Female",
-    sb_age       = 25,
-    sb_height    = 165.0,
-    sb_weight    = 60.0,
-    sb_activity  = "Active",
-    sb_pregnancy = "None",
+    result          = None,
+    dri             = None,
+    _last_uploaded  = "",
+    sb_name         = "",
+    sb_allergen     = "",
+    sb_sex          = "Female",
+    sb_age          = 25,
+    sb_height       = 165.0,
+    sb_weight       = 60.0,
+    sb_activity     = "Active",
+    sb_pregnancy    = "None",
 )
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
@@ -276,6 +278,47 @@ def bmi_color(cls):
     return {"Underweight":"#3B9AE1","Normal weight":"#2EC4B6",
             "Overweight":"#F4A261","Obese":"#E63946"}.get(cls,"#888")
 
+def _render_dri_profile(dri: dict, compact: bool = False):
+    """Render the DRI profile — shared between the Scan tab sidebar and the DRI tab."""
+    inp  = dri["inputs"]
+    bclr = bmi_color(dri["bmi_class"])
+    st.markdown(
+        f'<div style="background:#eef6ff;border-radius:10px;padding:10px 16px;'
+        f'font-size:13px;color:#1e3a5f;margin-bottom:12px">'
+        f'<b>{inp["sex"].title()}</b> · {inp["age"]} yrs · '
+        f'{inp["height_cm"]} cm · {inp["weight_kg"]} kg · '
+        f'<b>{inp["activity"]}</b>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+    m1, m2 = st.columns(2)
+    with m1:
+        st.metric("BMI", dri["bmi"])
+        st.markdown(
+            f'<span style="background:{bclr};color:white;border-radius:10px;'
+            f'padding:2px 10px;font-size:12px;font-weight:600">{dri["bmi_class"]}</span>',
+            unsafe_allow_html=True,
+        )
+    with m2:
+        st.metric("Daily Calories", f"{dri['eer']:,} kcal")
+    st.markdown("<br>", unsafe_allow_html=True)
+    with st.expander("🥦 Macronutrients", expanded=not compact):
+        rows = [{"Nutrient": k, "Recommended / Day": v["value"], "Basis": v["note"]}
+                for k, v in dri["macros"].items()]
+        st.dataframe(pd.DataFrame(rows).set_index("Nutrient"), use_container_width=True)
+    with st.expander("💊 Vitamins", expanded=False):
+        rows = []
+        for name, vals in dri["vitamins"].items():
+            ul = str(vals["ul"]) if vals["ul"] != "ND" else "—"
+            rows.append({"Vitamin": name, "RDA/AI": vals["rda"], "UL": ul})
+        st.dataframe(pd.DataFrame(rows).set_index("Vitamin"), use_container_width=True)
+    with st.expander("⚗️ Minerals", expanded=False):
+        rows = []
+        for name, vals in dri["minerals"].items():
+            ul = str(vals["ul"]) if vals["ul"] != "ND" else "—"
+            rows.append({"Mineral": name, "RDA/AI": vals["rda"], "UL": ul})
+        st.dataframe(pd.DataFrame(rows).set_index("Mineral"), use_container_width=True)
+
 def confidence_badge(score):
     if score >= 80: return f"🟢 {score}%"
     if score >= 50: return f"🟡 {score}%"
@@ -311,19 +354,20 @@ _NUT_LIMITS = {
 }
 
 def _strip_to_float(val):
-    import re as _re
     if val is None:
         return None, False
     s = str(val).strip()
-    if _re.fullmatch(r"0+\.?0*\s*%", s):
+    if re.fullmatch(r"0+\.?0*\s*%", s):
         return 0.0, False
     if "%" in s:
         return None, False
-    is_mg = bool(_re.search(r"mg", s, _re.IGNORECASE))
+    is_mg = bool(re.search(r"mg", s, re.IGNORECASE))
+    # Strip units before trying float conversion
+    s_stripped = re.sub(r"[a-zA-Z\s]+$", "", s).strip()
     try:
-        return float(s), is_mg
+        return float(s_stripped), is_mg
     except (ValueError, TypeError):
-        m = _re.search(r"-?\d+\.?\d*", s)
+        m = re.search(r"-?\d+\.?\d*", s)
         if m:
             try:
                 return float(m.group()), is_mg
@@ -346,10 +390,9 @@ def _clamp_nutrition(label, value, is_mg):
 def parse_nutrition(english):
     nut = (english or {}).get("nutrition") or {}
     if not nut: return None
-    import re as _re2
     def _qn(v):
         if v is None: return None
-        m = _re2.search(r'\d+\.?\d*', str(v))
+        m = re.search(r'\d+\.?\d*', str(v))
         return float(m.group()) if m else None
     sugar_v = _qn(nut.get("sugar"))
     carb_v  = _qn(nut.get("carbohydrate"))
@@ -390,7 +433,7 @@ def nutrition_pie(rows):
     for r in rows:
         if r["Nutrient"] not in keys: continue
         try: v = float(r["Amount"])
-        except: v = 0.0
+        except (ValueError, TypeError): v = 0.0
         if v>0: labels.append(r["Nutrient"]); values.append(v)
     if not labels: return None
     colors = ["#4C9BE8","#F4A261","#2EC4B6"][:len(labels)]
@@ -414,7 +457,7 @@ def dri_bar_chart(nut_rows, dri_raw):
         lv = lv_map.get(nutrient); dv = dri_raw.get(dri_key)
         if lv is not None and dv:
             try: names.append(nutrient); pcts.append(round(float(lv)/float(dv)*100,1))
-            except: pass
+            except (ValueError, TypeError, ZeroDivisionError): pass
     if not names: return None
     colors = ["#2EC4B6" if p<=25 else "#4C9BE8" if p<=50 else "#F4A261" if p<=80 else "#E63946"
               for p in pcts]
@@ -436,11 +479,10 @@ def _nutrition_output_from_result(result: dict) -> dict:
     """Convert scan result to the flat nutrition dict smart_pairing expects."""
     english = (result.get("ocr") or {}).get("english") or {}
     nut     = (english.get("nutrition")) or {}
-    import re as _re
 
     def _n(v):
         if v is None: return None
-        m = _re.search(r"\d+\.?\d*", str(v))
+        m = re.search(r"\d+\.?\d*", str(v))
         return float(m.group()) if m else None
 
     return {
@@ -477,9 +519,13 @@ with tab_scan:
         )
         if uploaded:
             st.image(uploaded, use_container_width=True)
-            _sig = uploaded.name + str(uploaded.size)
-            if st.session_state.get("_last_uploaded","") != _sig:
-                st.session_state.result = None
+            # Use file_id (stable across reruns) as signature; fall back to name+size
+            _sig = getattr(uploaded, "file_id", None) or (uploaded.name + str(uploaded.size))
+            # Only clear result when a genuinely new file is detected AND we're about to scan
+            # Clearing here (before scan click) caused result loss on tab switches
+            st.session_state["_current_sig"] = _sig
+        else:
+            st.session_state["_current_sig"] = ""
 
         user_name     = st.session_state.sb_name.strip()
         user_allergen = st.session_state.sb_allergen
@@ -493,59 +539,87 @@ with tab_scan:
             st.warning("✏️ Enter your name in the sidebar first.")
 
         if scan_clicked and scan_ready:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded.name).suffix) as tmp:
-                tmp.write(uploaded.read()); tmp_path = tmp.name
+            # Clear stale result only when a new file is being scanned
+            _current_sig = st.session_state.get("_current_sig", "")
+            if _current_sig != st.session_state.get("_last_uploaded", ""):
+                st.session_state.result = None
 
-            with st.spinner("🔄 Running OCR + translation…"):
-                from services.ocr import extract_label
-                ocr_result = extract_label(tmp_path)
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded.name).suffix) as tmp:
+                    uploaded.seek(0)  # rewind buffer in case st.image() already consumed it
+                    tmp.write(uploaded.read()); tmp_path = tmp.name
 
-            if ocr_result.get("error") and not ocr_result.get("ingredients"):
-                st.error(f"OCR failed: {ocr_result['error']}")
-            else:
-                ingredients_text = ocr_result.get("ingredients","")
-                english  = ocr_result.get("english") or {}
-                japanese = ocr_result.get("japanese") or {}
+                with st.spinner("🔄 Running OCR + translation…"):
+                    from services.ocr import extract_label
+                    ocr_result = extract_label(tmp_path)
 
-                with st.spinner("🔬 Detecting allergens & additives…"):
-                    detection = analyze_ingredients(ingredients_text)
+                if ocr_result.get("error") and not ocr_result.get("ingredients"):
+                    st.error(f"OCR failed: {ocr_result['error']}")
+                else:
+                    ingredients_text = ocr_result.get("ingredients","")
+                    english  = ocr_result.get("english") or {}
+                    japanese = ocr_result.get("japanese") or {}
 
-                en_nutrition  = (ocr_result.get("english") or {}).get("nutrition")
-                diet_result   = classify_diet(
-                    ingredients_flat = ingredients_text,
-                    nutrition        = en_nutrition,
-                    allergens        = detection["allergens"],
-                )
-                health_result = compute_health_score(
-                    ingredients_flat = ingredients_text,
-                    nutrition        = en_nutrition,
-                    additives        = detection["additives"],
-                    dri_raw          = (st.session_state.dri or {}).get("_raw"),
-                )
+                    # ── Sanitise OCR outputs before passing downstream ────────
+                    # Ensure nutrition is always a dict (never a raw string)
+                    raw_nutrition = english.get("nutrition")
+                    if not isinstance(raw_nutrition, dict):
+                        english["nutrition"] = {}
+                    # Ensure ingredients list is always a list of strings
+                    raw_ing = english.get("ingredients")
+                    if isinstance(raw_ing, str):
+                        english["ingredients"] = [i.strip() for i in raw_ing.split(",") if i.strip()]
+                    elif not isinstance(raw_ing, list):
+                        english["ingredients"] = []
+                    # ─────────────────────────────────────────────────────────
 
-                saved_img = save_image(tmp_path)
-                user_id   = save_record(
-                    user_id            = "",
-                    user_name          = user_name,
-                    user_allergen      = user_allergen,
-                    image_path         = saved_img,
-                    ingredients        = ingredients_text,
-                    detected_allergens = detection["allergens"],
-                    detected_additives = detection["additives"],
-                    dri                = st.session_state.dri,
-                )
+                    with st.spinner("🔬 Detecting allergens & additives…"):
+                        detection = analyze_ingredients(ingredients_text)
 
-                st.session_state.result = {
-                    "user_id":       user_id,
-                    "ocr":           ocr_result,
-                    "detection":     detection,
-                    "diet":          diet_result,
-                    "health":        health_result,
-                    "ingredients":   ingredients_text,
-                    "user_allergen": user_allergen,
-                    "confidence":    compute_confidence(japanese, english),
-                }
-                st.session_state._last_uploaded = uploaded.name + str(uploaded.size)
+                    en_nutrition  = (ocr_result.get("english") or {}).get("nutrition")
+                    diet_result   = classify_diet(
+                        ingredients_flat = ingredients_text,
+                        nutrition        = en_nutrition,
+                        allergens        = detection["allergens"],
+                    )
+                    health_result = compute_health_score(
+                        ingredients_flat = ingredients_text,
+                        nutrition        = en_nutrition,
+                        additives        = detection["additives"],
+                        dri_raw          = (st.session_state.dri or {}).get("_raw"),
+                    )
+
+                    saved_img = save_image(tmp_path)
+                    user_id   = save_record(
+                        user_id            = "",
+                        user_name          = user_name,
+                        user_allergen      = user_allergen,
+                        image_path         = saved_img,
+                        ingredients        = ingredients_text,
+                        detected_allergens = detection["allergens"],
+                        detected_additives = detection["additives"],
+                        dri                = st.session_state.dri,
+                    )
+
+                    st.session_state.result = {
+                        "user_id":       user_id,
+                        "ocr":           ocr_result,
+                        "detection":     detection,
+                        "diet":          diet_result,
+                        "health":        health_result,
+                        "ingredients":   ingredients_text,
+                        "user_allergen": user_allergen,
+                        "confidence":    compute_confidence(japanese, english),
+                    }
+                    st.session_state._last_uploaded = getattr(uploaded, "file_id", None) or (uploaded.name + str(uploaded.size))
+            finally:
+                # Clean up temp file — save_image() has already copied it to data/images/
+                if tmp_path:
+                    try:
+                        Path(tmp_path).unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
         # ── Show results ──────────────────────────────────────────────────────
         if st.session_state.result:
@@ -752,7 +826,7 @@ with tab_scan:
                                     pct = round(float(lv)/float(dv)*100, 1)
                                     comp_rows.append({"Nutrient":nutrient,"In Product":f"{lv}",
                                                       "Daily DRI":dlabel,"% of Need":f"{pct}%"})
-                                except: pass
+                                except (ValueError, TypeError, ZeroDivisionError): pass
                         if comp_rows:
                             st.dataframe(pd.DataFrame(comp_rows).set_index("Nutrient"),
                                          use_container_width=True)
@@ -783,45 +857,7 @@ with tab_scan:
             </div>
             """, unsafe_allow_html=True)
         else:
-            dri  = st.session_state.dri
-            inp  = dri["inputs"]
-            bclr = bmi_color(dri["bmi_class"])
-            st.markdown(
-                f'<div style="background:#eef6ff;border-radius:10px;padding:10px 16px;'
-                f'font-size:13px;color:#1e3a5f;margin-bottom:12px">'
-                f'<b>{inp["sex"].title()}</b> · {inp["age"]} yrs · '
-                f'{inp["height_cm"]} cm · {inp["weight_kg"]} kg · '
-                f'<b>{inp["activity"]}</b>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
-            m1, m2 = st.columns(2)
-            with m1:
-                st.metric("BMI", dri["bmi"])
-                st.markdown(
-                    f'<span style="background:{bclr};color:white;border-radius:10px;'
-                    f'padding:2px 10px;font-size:12px;font-weight:600">{dri["bmi_class"]}</span>',
-                    unsafe_allow_html=True,
-                )
-            with m2:
-                st.metric("Daily Calories", f"{dri['eer']:,} kcal")
-            st.markdown("<br>", unsafe_allow_html=True)
-            with st.expander("🥦 Macronutrients", expanded=True):
-                rows = [{"Nutrient":k,"Recommended / Day":v["value"],"Basis":v["note"]}
-                        for k,v in dri["macros"].items()]
-                st.dataframe(pd.DataFrame(rows).set_index("Nutrient"), use_container_width=True)
-            with st.expander("💊 Vitamins", expanded=False):
-                rows = []
-                for name,vals in dri["vitamins"].items():
-                    ul = str(vals["ul"]) if vals["ul"] != "ND" else "—"
-                    rows.append({"Vitamin":name,"RDA/AI":vals["rda"],"UL":ul})
-                st.dataframe(pd.DataFrame(rows).set_index("Vitamin"), use_container_width=True)
-            with st.expander("⚗️ Minerals", expanded=False):
-                rows = []
-                for name,vals in dri["minerals"].items():
-                    ul = str(vals["ul"]) if vals["ul"] != "ND" else "—"
-                    rows.append({"Mineral":name,"RDA/AI":vals["rda"],"UL":ul})
-                st.dataframe(pd.DataFrame(rows).set_index("Mineral"), use_container_width=True)
+            _render_dri_profile(st.session_state.dri, compact=True)
 
 
 # ════════════════════════════════════════════════════
@@ -847,7 +883,6 @@ with tab_pair:
         product_name      = (english.get("product_name") or "Scanned product")
 
         # ── Controls ─────────────────────────────────────────────────────────
-        # REPLACE WITH:
         pc1, pc2, pc3 = st.columns([3, 2, 2])
         with pc1:
             st.markdown(f"**Scanned product:** {product_name}")
@@ -901,7 +936,6 @@ with tab_pair:
 
         run_pairing = st.button("🔍 Find Pairings", type="primary")
 
-        # REPLACE WITH:
         if run_pairing:
             with st.spinner("Scoring database products…"):
                 # Apply category + brand filters to DB before scoring
@@ -940,6 +974,7 @@ with tab_pair:
                 )
 
                 # Diversity filter: max 2 per brand (first word), keep top_n overall
+                pre_diversity_count = len(pairing["top_pairings"])
                 seen_brands: dict[str, int] = {}
                 diverse = []
                 for c in pairing["top_pairings"]:
@@ -954,11 +989,11 @@ with tab_pair:
                 pairing["_filter_note"] = (
                     f"Categories: {', '.join(selected_categories) or 'All'}  |  "
                     f"Brands: {', '.join(selected_brands) or 'All'}  |  "
-                    f"Showing top {len(diverse)} (diversity-filtered from {len(pairing['top_pairings'])+len(diverse)} scored)"
+                    f"Showing top {len(diverse)} (diversity-filtered from {pre_diversity_count} scored)"
                 )
+                pairing["_meals_used"] = meals  # store so display caption stays consistent
                 st.session_state["pairing"] = pairing
 
-        # REPLACE WITH:
         if "pairing" in st.session_state:
             pairing = st.session_state["pairing"]
 
@@ -969,7 +1004,7 @@ with tab_pair:
             # ── Nutrient gap summary ──────────────────────────────────────────
             st.markdown("---")
             st.markdown("### 📊 Nutrient Gap After Scanned Product")
-            st.caption(f"Per-meal target = daily DRI ÷ {meals} meals")
+            st.caption(f"Per-meal target = daily DRI ÷ {pairing.get('_meals_used', meals)} meals")
 
             gap      = pairing["gap_after_scan"]
             target   = pairing["meal_dri_target"]
@@ -1085,51 +1120,7 @@ with tab_dri:
         </div>
         """, unsafe_allow_html=True)
     else:
-        dri  = st.session_state.dri
-        inp  = dri["inputs"]
-        bclr = bmi_color(dri["bmi_class"])
-
-        st.markdown(
-            f'<div style="background:#eef6ff;border-radius:10px;padding:10px 16px;'
-            f'font-size:13px;color:#1e3a5f;margin-bottom:12px">'
-            f'<b>{inp["sex"].title()}</b> · {inp["age"]} yrs · '
-            f'{inp["height_cm"]} cm · {inp["weight_kg"]} kg · '
-            f'<b>{inp["activity"]}</b>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-
-        m1, m2 = st.columns(2)
-        with m1:
-            st.metric("BMI", dri["bmi"])
-            st.markdown(
-                f'<span style="background:{bclr};color:white;border-radius:10px;'
-                f'padding:2px 10px;font-size:12px;font-weight:600">{dri["bmi_class"]}</span>',
-                unsafe_allow_html=True,
-            )
-        with m2:
-            st.metric("Daily Calories", f"{dri['eer']:,} kcal")
-
-        st.markdown("<br>", unsafe_allow_html=True)
-
-        with st.expander("🥦 Macronutrients", expanded=True):
-            rows = [{"Nutrient":k,"Recommended / Day":v["value"],"Basis":v["note"]}
-                    for k,v in dri["macros"].items()]
-            st.dataframe(pd.DataFrame(rows).set_index("Nutrient"), use_container_width=True)
-
-        with st.expander("💊 Vitamins", expanded=False):
-            rows = []
-            for name,vals in dri["vitamins"].items():
-                ul = str(vals["ul"]) if vals["ul"] != "ND" else "—"
-                rows.append({"Vitamin":name,"RDA/AI":vals["rda"],"UL":ul})
-            st.dataframe(pd.DataFrame(rows).set_index("Vitamin"), use_container_width=True)
-
-        with st.expander("⚗️ Minerals", expanded=False):
-            rows = []
-            for name,vals in dri["minerals"].items():
-                ul = str(vals["ul"]) if vals["ul"] != "ND" else "—"
-                rows.append({"Mineral":name,"RDA/AI":vals["rda"],"UL":ul})
-            st.dataframe(pd.DataFrame(rows).set_index("Mineral"), use_container_width=True)
+        _render_dri_profile(st.session_state.dri, compact=False)
 
         st.markdown(
             '<div style="background:#f0faf4;border-radius:8px;padding:10px 14px;'
