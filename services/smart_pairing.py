@@ -134,7 +134,7 @@ def detect_additives_db(ingredients_text: str, additives_df: pd.DataFrame) -> li
     # Find the name column
     name_col = next(
         (c for c in additives_df.columns
-         if c.strip().lower() in ("name_en", "name", "additive_name", "additive")),
+        if c.strip().lower() in ("name_en", "name", "additive_name", "additive")),
         additives_df.columns[0],
     )
 

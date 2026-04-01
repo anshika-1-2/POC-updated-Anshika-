@@ -1,0 +1,3 @@
+user_id,username,password_hash,name,allergen,sex,age,height_cm,weight_kg,activity,pregnancy,registered_at
+1FF5089BEB,Anshika,a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3,Anshika,almond,Female,21,152.0,40.0,Active,None,2026-03-31T06:42:07
+3AA6057B83,A,03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4,Anshika,,Female,21,154.0,41.0,Active,None,2026-03-31T10:06:44

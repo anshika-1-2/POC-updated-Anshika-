@@ -4,12 +4,24 @@ Stage 1: image → Japanese JSON  (Qwen2.5-VL)
 Stage 2: Japanese JSON → English JSON  (text only)
 """
 
+import gc
+import os
 import re
 import json
 import time
 import torch
 
+# Set memory allocator to use expandable segments to reduce fragmentation
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
 _model = _processor = _device = None
+
+# Max pixels: lower = less VRAM per image. 1280*28*28 ≈ 1B px (original).
+# 720p-equivalent is 1280*720 = ~921k px — a good balance for label photos.
+_MAX_PIXELS = int(os.environ.get("OCR_MAX_PIXELS", str(1280 * 720)))
+# Max new tokens per stage. Stage 2 (translation) needs fewer tokens.
+_MAX_TOKENS_S1 = int(os.environ.get("OCR_MAX_TOKENS_S1", "512"))
+_MAX_TOKENS_S2 = int(os.environ.get("OCR_MAX_TOKENS_S2", "512"))
 
 JP_ALLERGEN_MAP = {
     "小麦": "wheat",       "乳": "milk",           "卵": "egg",
@@ -26,16 +38,42 @@ JP_ALLERGEN_MAP = {
 
 
 def _load_model():
+    """
+    Load Qwen2.5-VL-7B with memory-efficient settings:
+    - bfloat16 weights  (~14 GB → ~7 GB on GPU)
+    - device_map="auto" lets accelerate shard across GPU+CPU if needed
+    - max_memory cap reserves headroom for activations
+    - low_cpu_mem_usage avoids double-buffering during load
+    """
     global _model, _processor, _device
     if _model is not None:
         return
     from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
     from qwen_vl_utils import process_vision_info  # noqa
+
     _device = "cuda" if torch.cuda.is_available() else "cpu"
     model_id = "Qwen/Qwen2.5-VL-7B-Instruct"
-    _processor = AutoProcessor.from_pretrained(model_id, min_pixels=200*200, max_pixels=1280*28*28)
+
+    _processor = AutoProcessor.from_pretrained(
+        model_id,
+        min_pixels=200 * 200,
+        max_pixels=_MAX_PIXELS,
+    )
+
+    # Reserve ~1.5 GB of GPU VRAM for activations/KV-cache; overflow goes to CPU RAM
+    max_mem: dict = {}
+    if _device == "cuda":
+        total_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        reserved_gb = max(1.5, total_gb * 0.10)   # 10% or 1.5 GB, whichever is larger
+        max_mem = {0: f"{total_gb - reserved_gb:.1f}GiB", "cpu": "24GiB"}
+
     _model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        model_id, torch_dtype=torch.bfloat16, device_map="auto")
+        model_id,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        max_memory=max_mem if max_mem else None,
+        low_cpu_mem_usage=True,
+    )
     _model.eval()
 
 
@@ -142,27 +180,95 @@ def _safe_parse(raw: str):
     return None, err
 
 
-def _generate(messages, has_image, max_new_tokens=768):
+def _free_cache():
+    """Release unused CUDA cache and run Python GC."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+
+def _generate(messages, has_image, max_new_tokens=512):
+    """
+    Run one generation pass with OOM recovery:
+    - On first OOM: flush cache and retry at half the pixel budget
+    - On second OOM: raise with a clear message
+    Input tensors are deleted immediately after generation to free activations.
+    """
     from qwen_vl_utils import process_vision_info
-    image_inputs, video_inputs = process_vision_info(messages)
-    text_in = _processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = _processor(
-        text=[text_in],
-        images=image_inputs if has_image else None,
-        videos=video_inputs if has_image else None,
-        padding=True, return_tensors="pt",
-    ).to(_device)
-    t0 = time.time()
-    with torch.no_grad():
-        out = _model.generate(
-            **inputs, max_new_tokens=max_new_tokens,
-            temperature=0.05, do_sample=True,
-            repetition_penalty=1.1, top_p=0.9,
+
+    def _run(pixel_cap):
+        """Build inputs and generate; pixel_cap controls image downscaling."""
+        image_inputs, video_inputs = process_vision_info(messages)
+
+        # Downscale image inputs if pixel_cap < _MAX_PIXELS
+        if has_image and pixel_cap < _MAX_PIXELS and image_inputs:
+            # process_vision_info returns PIL images; resize the longest edge
+            try:
+                import math
+                resized = []
+                for img in image_inputs:
+                    w, h = img.size
+                    total = w * h
+                    if total > pixel_cap:
+                        scale = math.sqrt(pixel_cap / total)
+                        img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+                    resized.append(img)
+                image_inputs = resized
+            except Exception:
+                pass  # if resize fails, proceed with original
+
+        text_in = _processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
         )
-    latency = round(time.time() - t0, 2)
-    new_toks = out.shape[1] - inputs["input_ids"].shape[1]
-    raw = _processor.batch_decode(out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0].strip()
-    return raw, latency, new_toks
+        inputs = _processor(
+            text=[text_in],
+            images=image_inputs if has_image else None,
+            videos=video_inputs if has_image else None,
+            padding=True,
+            return_tensors="pt",
+        ).to(_device)
+
+        t0 = time.time()
+        with torch.no_grad():
+            out = _model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=0.05,
+                do_sample=True,
+                repetition_penalty=1.1,
+                top_p=0.9,
+            )
+        latency = round(time.time() - t0, 2)
+        new_toks = out.shape[1] - inputs["input_ids"].shape[1]
+        raw = _processor.batch_decode(
+            out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
+        )[0].strip()
+
+        # Explicitly free activation tensors before next call
+        del inputs, out
+        _free_cache()
+
+        return raw, latency, new_toks
+
+    # ── First attempt at full resolution ────────────────────────────────────
+    try:
+        return _run(_MAX_PIXELS)
+    except torch.OutOfMemoryError:
+        _free_cache()
+
+    # ── OOM retry at half the pixel budget ──────────────────────────────────
+    try:
+        reduced = _MAX_PIXELS // 2
+        return _run(reduced)
+    except torch.OutOfMemoryError as e:
+        _free_cache()
+        raise RuntimeError(
+            f"CUDA OOM even at reduced resolution ({_MAX_PIXELS // 2} px). "
+            "Try closing other GPU processes, reducing OCR_MAX_PIXELS, "
+            "or setting PYTORCH_ALLOC_CONF=expandable_segments:True. "
+            f"Original error: {e}"
+        ) from e
 
 
 def _smart_split(text):
@@ -186,14 +292,22 @@ def _smart_split(text):
 def extract_label(image_path: str) -> dict:
     _load_model()
 
-    # Stage 1: OCR
-    s1_raw, s1_lat, _ = _generate([
-        {"role": "system", "content": SYSTEM_OCR},
-        {"role": "user", "content": [
-            {"type": "image", "image": image_path},
-            {"type": "text",  "text": PROMPT_OCR},
-        ]},
-    ], has_image=True)
+    # Flush any leftover cache before starting
+    _free_cache()
+
+    # Stage 1: OCR (image → Japanese JSON)
+    try:
+        s1_raw, s1_lat, _ = _generate([
+            {"role": "system", "content": SYSTEM_OCR},
+            {"role": "user", "content": [
+                {"type": "image", "image": image_path},
+                {"type": "text",  "text": PROMPT_OCR},
+            ]},
+        ], has_image=True, max_new_tokens=_MAX_TOKENS_S1)
+    except RuntimeError as oom_err:
+        return {"japanese": None, "english": None, "ingredients": "",
+                "latency_s": 0, "error": str(oom_err), "s1_raw": "", "s2_raw": ""}
+
     jp_parsed, jp_err = _safe_parse(s1_raw)
 
     if jp_parsed is None:
@@ -201,13 +315,22 @@ def extract_label(image_path: str) -> dict:
                 "latency_s": s1_lat, "error": f"OCR parse failed: {jp_err}",
                 "s1_raw": s1_raw, "s2_raw": ""}
 
-    # Stage 2: Translate
+    # Free image activations before Stage 2
+    _free_cache()
+
+    # Stage 2: Translate (Japanese JSON → English JSON, text-only — no image)
     ocr_str = json.dumps(jp_parsed, ensure_ascii=False, indent=2)
     prompt  = PROMPT_TRANSLATE_TEMPLATE.replace("{ocr_json}", ocr_str)
-    s2_raw, s2_lat, _ = _generate([
-        {"role": "system", "content": SYSTEM_TRANSLATE},
-        {"role": "user",   "content": [{"type": "text", "text": prompt}]},
-    ], has_image=False)
+    try:
+        s2_raw, s2_lat, _ = _generate([
+            {"role": "system", "content": SYSTEM_TRANSLATE},
+            {"role": "user",   "content": [{"type": "text", "text": prompt}]},
+        ], has_image=False, max_new_tokens=_MAX_TOKENS_S2)
+    except RuntimeError as oom_err:
+        # Stage 1 succeeded; return partial result rather than total failure
+        return {"japanese": jp_parsed, "english": None, "ingredients": "",
+                "latency_s": s1_lat, "error": f"Translation OOM: {oom_err}",
+                "s1_raw": s1_raw, "s2_raw": ""}
     en_parsed, en_err = _safe_parse(s2_raw)
     english = (en_parsed or {}).get("english") or en_parsed or {}
 
@@ -323,7 +446,8 @@ def extract_label(image_path: str) -> dict:
         try:
             m = re.search(r"\d+\.?\d*", str(v))
             return float(m.group()) if m else None
-        except: return None
+        except (AttributeError, ValueError, TypeError):
+            return None
 
     fat_v  = _to_num(nut_en.get("fat"))
     satf_v = _to_num(nut_en.get("saturated_fat"))

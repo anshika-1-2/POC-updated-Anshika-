@@ -3,15 +3,15 @@ health_score.py
 Personalised health scoring for Japanese food products.
 
 Scoring rubric (total 100 pts):
-  A) Ingredient quality     30 pts  (order + red-flag ingredient check)
-  B) Macronutrient balance  30 pts  (sugar, sat-fat, protein, fibre)
-  C) Sodium                 20 pts
-  D) Additive risk          20 pts  (tiered: benign / caution / avoid)
+    A) Ingredient quality     30 pts  (order + red-flag ingredient check)
+    B) Macronutrient balance  30 pts  (sugar, sat-fat, protein, fibre)
+    C) Sodium                 20 pts
+    D) Additive risk          20 pts  (tiered: benign / caution / avoid)
 
 Final verdict:
-  70–100 → Healthy
-  40–69  → Moderate
-  0–39   → Unhealthy
+    70–100 → Healthy
+    40–69  → Moderate
+    0–39   → Unhealthy
 
 Personalisation: if user has a DRI profile, thresholds for B and C are
 scaled relative to the user's EER and sodium AI (not fixed per-100g values).
@@ -139,10 +139,10 @@ def _score_macros(
     and max is reduced proportionally so score stays honest.
 
     Signals and their max contribution:
-      sugar        : 12 pts (penalty focus)
-      saturated fat: 10 pts (penalty focus)
-      fibre        :  5 pts (bonus)
-      protein      :  3 pts (bonus)
+        sugar        : 12 pts (penalty focus)
+        saturated fat: 10 pts (penalty focus)
+        fibre        :  5 pts (bonus)
+        protein      :  3 pts (bonus)
     Total possible: 30 pts
     """
     flags  = []
@@ -292,17 +292,17 @@ def compute_health_score(
     Returns
     -------
     {
-      "score":    int (0–100),
-      "verdict":  "Healthy" | "Moderate" | "Unhealthy",
-      "grade":    "A" | "B" | "C" | "D" | "F",
-      "sections": {
-        "ingredients": {"score":int, "max":30, "flags":[], "boosts":[]},
-        "macros":      {"score":int, "max":30, ...},
-        "sodium":      {"score":int, "max":20, ...},
-        "additives":   {"score":int, "max":20, ...},
-      },
-      "top_flags":  [str, ...],   # up to 4 most important negatives
-      "top_boosts": [str, ...],   # up to 3 most important positives
+        "score":    int (0–100),
+        "verdict":  "Healthy" | "Moderate" | "Unhealthy",
+        "grade":    "A" | "B" | "C" | "D" | "F",
+        "sections": {
+            "ingredients": {"score":int, "max":30, "flags":[], "boosts":[]},
+            "macros":      {"score":int, "max":30, ...},
+            "sodium":      {"score":int, "max":20, ...},
+            "additives":   {"score":int, "max":20, ...},
+        },
+        "top_flags":  [str, ...],   # up to 4 most important negatives
+        "top_boosts": [str, ...],   # up to 3 most important positives
     }
     """
     nutrition = nutrition or {}
